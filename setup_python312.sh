@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# setup_python312.sh — Python 3.12 Installation & Configuration for Ubuntu 22.04
+# setup_python312.sh — Python 3.12 Installation & Configuration for Ubuntu
 # ==============================================================================
 #
-# Fully installs, configures, and verifies Python 3.12 on Ubuntu 22.04 (Jammy).
+# Fully installs, configures, and verifies Python 3.12 on Ubuntu 20.04/22.04.
+# On 22.04 (Jammy): installs via deadsnakes PPA packages.
+# On 20.04 (Focal): tries deadsnakes PPA, falls back to building from source.
 # Designed for fresh machines — handles everything from system prerequisites,
 # deadsnakes PPA, package installation, pip bootstrap, symlink/alternatives
 # setup, and comprehensive verification.
@@ -29,6 +31,11 @@ readonly SCRIPT_NAME="$(basename "$0")"
 readonly PYTHON_VERSION="3.12"
 readonly PYTHON_BIN="python${PYTHON_VERSION}"
 readonly LOG_FILE="/tmp/setup_python312_$(date +%Y%m%d_%H%M%S).log"
+readonly PYTHON_SRC_VERSION="3.12.10"
+
+# Detected at runtime in preflight()
+UBUNTU_VERSION_ID=""
+UBUNTU_CODENAME=""
 
 # Packages needed before we can add the PPA
 readonly PREREQ_PACKAGES=(
@@ -181,18 +188,31 @@ preflight() {
     fi
     ok "Running as root"
 
-    # Verify Ubuntu 22.04
+    # Verify Ubuntu version
     if [[ -f /etc/os-release ]]; then
         # shellcheck disable=SC1091
         source /etc/os-release
-        if [[ "${VERSION_ID:-}" == "22.04" ]]; then
-            ok "OS: ${PRETTY_NAME}"
-        elif [[ "${ID:-}" == "ubuntu" ]]; then
-            warn "Detected ${PRETTY_NAME:-Ubuntu unknown}. Script targets 22.04."
-            warn "Proceeding — some packages may differ."
-        else
-            die "Unsupported OS: ${PRETTY_NAME:-unknown}. This script requires Ubuntu."
-        fi
+        UBUNTU_VERSION_ID="${VERSION_ID:-}"
+        UBUNTU_CODENAME="${VERSION_CODENAME:-}"
+
+        case "$UBUNTU_VERSION_ID" in
+            22.04)
+                ok "OS: ${PRETTY_NAME}"
+                ;;
+            20.04)
+                ok "OS: ${PRETTY_NAME}"
+                log "Ubuntu 20.04 — will build from source if PPA packages fail."
+                ;;
+            *)
+                if [[ "${ID:-}" == "ubuntu" ]]; then
+                    warn "Detected ${PRETTY_NAME:-Ubuntu unknown}. Script targets 20.04/22.04."
+                    warn "Proceeding — some packages may differ."
+                    UBUNTU_VERSION_ID="${VERSION_ID:-unknown}"
+                else
+                    die "Unsupported OS: ${PRETTY_NAME:-unknown}. This script requires Ubuntu."
+                fi
+                ;;
+        esac
     else
         die "/etc/os-release not found — cannot verify distribution."
     fi
@@ -312,14 +332,96 @@ setup_ppa() {
 }
 
 # ==============================================================================
+# PHASE 4 (source fallback): Build Python 3.12 from source for Ubuntu 20.04
+# ==============================================================================
+
+build_from_source() {
+    step "Phase 4b: Building Python ${PYTHON_VERSION} from source"
+
+    log "PPA packages unavailable — building Python ${PYTHON_SRC_VERSION} from source."
+    log "This will take 5-15 minutes depending on your machine."
+
+    # Remove any broken PPA package before source build
+    apt-get remove -y "python${PYTHON_VERSION}" >>"$LOG_FILE" 2>&1 || true
+
+    local build_dir
+    build_dir="$(mktemp -d /tmp/python-build.XXXXXX)"
+    local src_url="https://www.python.org/ftp/python/${PYTHON_SRC_VERSION}/Python-${PYTHON_SRC_VERSION}.tgz"
+
+    log "Downloading Python ${PYTHON_SRC_VERSION}..."
+    if ! curl -sSL --retry 3 "$src_url" -o "${build_dir}/Python-${PYTHON_SRC_VERSION}.tgz" 2>>"$LOG_FILE"; then
+        rm -rf "$build_dir"
+        die "Failed to download Python source from ${src_url}"
+    fi
+    ok "Source downloaded"
+
+    log "Extracting..."
+    if ! tar -xzf "${build_dir}/Python-${PYTHON_SRC_VERSION}.tgz" -C "$build_dir" >>"$LOG_FILE" 2>&1; then
+        rm -rf "$build_dir"
+        die "Failed to extract source archive"
+    fi
+
+    log "Configuring..."
+    if ! (cd "${build_dir}/Python-${PYTHON_SRC_VERSION}" && \
+          ./configure \
+              --enable-optimizations \
+              --with-ensurepip=install \
+              --enable-shared \
+              --prefix=/usr/local \
+              LDFLAGS="-Wl,-rpath,/usr/local/lib" \
+              >>"$LOG_FILE" 2>&1); then
+        rm -rf "$build_dir"
+        die "Configure failed. Check build dependencies in ${LOG_FILE}"
+    fi
+    ok "Configure complete"
+
+    local nproc
+    nproc="$(nproc 2>/dev/null || echo 2)"
+    log "Building with ${nproc} cores..."
+    if ! make -C "${build_dir}/Python-${PYTHON_SRC_VERSION}" -j"$nproc" >>"$LOG_FILE" 2>&1; then
+        rm -rf "$build_dir"
+        die "Build failed. Check ${LOG_FILE}"
+    fi
+    ok "Build complete"
+
+    log "Installing to /usr/local (altinstall)..."
+    if ! make -C "${build_dir}/Python-${PYTHON_SRC_VERSION}" altinstall >>"$LOG_FILE" 2>&1; then
+        rm -rf "$build_dir"
+        die "altinstall failed. Check ${LOG_FILE}"
+    fi
+    ok "Installed: /usr/local/bin/${PYTHON_BIN}"
+
+    ldconfig 2>/dev/null || true
+
+    if [[ ! -x "/usr/bin/${PYTHON_BIN}" ]] && [[ -x "/usr/local/bin/${PYTHON_BIN}" ]]; then
+        ln -sf "/usr/local/bin/${PYTHON_BIN}" "/usr/bin/${PYTHON_BIN}"
+        ok "Symlinked → /usr/bin/${PYTHON_BIN}"
+    fi
+
+    rm -rf "$build_dir"
+    ok "Build artifacts cleaned up"
+}
+
+# ==============================================================================
 # PHASE 4: Install Python 3.12 and all companion packages
 # ==============================================================================
 
 install_python() {
     step "Phase 4: Installing Python ${PYTHON_VERSION}"
 
+    # On 20.04, trim packages that don't exist in the deadsnakes PPA for focal
+    local packages=("${PYTHON_PACKAGES[@]}")
+    if [[ "$UBUNTU_VERSION_ID" == "20.04" ]]; then
+        packages=(
+            "python${PYTHON_VERSION}"
+            "python${PYTHON_VERSION}-venv"
+            "python${PYTHON_VERSION}-dev"
+            "libpython${PYTHON_VERSION}-dev"
+        )
+    fi
+
     local missing=()
-    missing_packages missing "${PYTHON_PACKAGES[@]}"
+    missing_packages missing "${packages[@]}"
 
     if [[ ${#missing[@]} -eq 0 ]]; then
         ok "All Python ${PYTHON_VERSION} packages already installed"
@@ -349,25 +451,42 @@ install_python() {
                     fi
                 done
                 if $critical_fail; then
-                    die "Failed to install python${PYTHON_VERSION}. Cannot continue."
+                    if [[ "$UBUNTU_VERSION_ID" == "20.04" ]]; then
+                        warn "PPA install failed on 20.04 — will try source build."
+                    else
+                        die "Failed to install python${PYTHON_VERSION}. Cannot continue."
+                    fi
                 fi
             fi
         fi
     fi
 
-    # Verify the binary actually exists now
+    # Verify the binary exists — fall back to source build on 20.04
     if ! $DRY_RUN; then
-        if ! command -v "$PYTHON_BIN" &>/dev/null; then
-            # Check common paths manually
-            if [[ -x "/usr/bin/${PYTHON_BIN}" ]]; then
-                ok "Binary found at /usr/bin/${PYTHON_BIN} (not in PATH — will fix)"
+        if ! command -v "$PYTHON_BIN" &>/dev/null && \
+           [[ ! -x "/usr/bin/${PYTHON_BIN}" ]] && \
+           [[ ! -x "/usr/local/bin/${PYTHON_BIN}" ]]; then
+            if [[ "$UBUNTU_VERSION_ID" == "20.04" ]]; then
+                warn "${PYTHON_BIN} not found from PPA packages."
+                build_from_source
             else
                 die "${PYTHON_BIN} binary not found after installation. Something went wrong."
             fi
         fi
+
+        if command -v "$PYTHON_BIN" &>/dev/null; then
+            : # found in PATH
+        elif [[ -x "/usr/bin/${PYTHON_BIN}" ]]; then
+            ok "Binary found at /usr/bin/${PYTHON_BIN} (not in PATH — will fix)"
+        elif [[ -x "/usr/local/bin/${PYTHON_BIN}" ]]; then
+            ok "Binary found at /usr/local/bin/${PYTHON_BIN} (source build)"
+        else
+            die "${PYTHON_BIN} binary not found after all installation attempts."
+        fi
+
         local installed_ver
         installed_ver="$("$PYTHON_BIN" --version 2>&1)"
-        ok "Installed: ${installed_ver} at $(command -v "$PYTHON_BIN")"
+        ok "Installed: ${installed_ver} at $(command -v "$PYTHON_BIN" || echo "/usr/local/bin/${PYTHON_BIN}")"
     fi
 }
 
@@ -471,7 +590,7 @@ configure_alternatives() {
         return 0
     fi
 
-    # Detect existing system python (usually 3.10 on Jammy)
+    # Detect existing system python (3.8 on Focal, 3.10 on Jammy)
     local system_python=""
     for candidate in /usr/bin/python3.10 /usr/bin/python3.11 /usr/bin/python3.8; do
         if [[ -x "$candidate" ]]; then
@@ -487,17 +606,20 @@ configure_alternatives() {
     fi
 
     # Register python3.12 — priority depends on --set-default flag
-    if [[ -x "/usr/bin/${PYTHON_BIN}" ]]; then
+    # Source builds install to /usr/local/bin; PPA installs to /usr/bin
+    local py312_path="/usr/bin/${PYTHON_BIN}"
+    [[ ! -x "$py312_path" ]] && [[ -x "/usr/local/bin/${PYTHON_BIN}" ]] && py312_path="/usr/local/bin/${PYTHON_BIN}"
+    if [[ -x "$py312_path" ]]; then
         local priority=5
         if $SET_DEFAULT; then
             priority=20
         fi
-        update-alternatives --install /usr/bin/python3 python3 "/usr/bin/${PYTHON_BIN}" "$priority" >>"$LOG_FILE" 2>&1 || true
-        ok "Registered: ${PYTHON_BIN} (priority ${priority})"
+        update-alternatives --install /usr/bin/python3 python3 "$py312_path" "$priority" >>"$LOG_FILE" 2>&1 || true
+        ok "Registered: ${PYTHON_BIN} (priority ${priority}) [${py312_path}]"
     fi
 
     if $SET_DEFAULT; then
-        update-alternatives --set python3 "/usr/bin/${PYTHON_BIN}" >>"$LOG_FILE" 2>&1 || true
+        update-alternatives --set python3 "$py312_path" >>"$LOG_FILE" 2>&1 || true
         ok "Default python3 → ${PYTHON_BIN}"
         echo ""
         warn "System python3 now points to ${PYTHON_VERSION}."
@@ -657,7 +779,7 @@ main() {
     echo ""
     echo -e "${BOLD}╔═══════════════════════════════════════════════════════════════╗${RESET}"
     echo -e "${BOLD}║  Python ${PYTHON_VERSION} — Full Setup & Configuration                  ║${RESET}"
-    echo -e "${BOLD}║  Target: Ubuntu 22.04 LTS (Jammy Jellyfish)                  ║${RESET}"
+    echo -e "${BOLD}║  Target: Ubuntu 20.04 / 22.04 LTS                            ║${RESET}"
     echo -e "${BOLD}╚═══════════════════════════════════════════════════════════════╝${RESET}"
     echo ""
 
